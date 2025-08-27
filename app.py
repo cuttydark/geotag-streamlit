@@ -19,7 +19,11 @@ def _parse_decimal_pair(text: str):
     return None
 
 def _parse_google_maps_url(text: str):
-    # @lat,lon,zoom
+    # Preferir coordenadas del lugar (!3dLAT!4dLON)
+    m = re.search(r'!3d([-+]?\d+(?:\.\d+)?)!4d([-+]?\d+(?:\.\d+)?)', text)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    # Centro del encuadre @lat,lon
     m = re.search(r'@([-+]?\d+(?:\.\d+)?),\s*([-+]?\d+(?:\.\d+)?)', text)
     if m:
         return float(m.group(1)), float(m.group(2))
@@ -225,12 +229,12 @@ if files and st.button("Geoetiquetar"):
     for uf in files:
         try:
             out_name, before, after, out_bytes = process_file(
-                uf,
-                lat=lat,
-                lon=lon,
-                alt=(alt if use_alt else None),
-                when=(dt if use_date else None),
-            )
+    uf,
+    lat=float(st.session_state.lat),   # usar estado, no la variable local
+    lon=float(st.session_state.lon),
+    alt=(alt if use_alt else None),
+    when=(dt if use_date else None),
+)
             results.append((out_name, before, after, out_bytes))
         except Exception as e:
             st.error(f"Error con {uf.name}: {e}")
