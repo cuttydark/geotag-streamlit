@@ -1,4 +1,4 @@
-import io, os, tempfile, zipfile
+import io, os, re, tempfile, zipfile
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -6,11 +6,76 @@ import streamlit as st
 from PIL import Image
 import piexif
 
-# --- Config ---
+# ---------------- Config ----------------
 SUPPORTED_WRITE = (".jpg", ".jpeg", ".tif", ".tiff")
 SUPPORTED_READ = SUPPORTED_WRITE + (".webp",)
 
-# --- Utilidades EXIF ---
+# ---------------- Parsers coordenadas ----------------
+def _parse_decimal_pair(text: str):
+    # Ej: 50.8291246, 4.3705335  |  "50.8291246 4.3705335"
+    m = re.search(r'([-+]?\d+(?:\.\d+)?)\s*[, ]\s*([-+]?\d+(?:\.\d+)?)', text)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    return None
+
+def _parse_google_maps_url(text: str):
+    # @lat,lon,zoom
+    m = re.search(r'@([-+]?\d+(?:\.\d+)?),\s*([-+]?\d+(?:\.\d+)?)', text)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    # q=lat,lon
+    m = re.search(r'[?&]q=([-+]?\d+(?:\.\d+)?),\s*([-+]?\d+(?:\.\d+)?)', text)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    return None
+
+def _dms_token(tok: str):
+    # 50°49'44.9"N  -> (50,49,44.9,'N')
+    tok = tok.strip()
+    m = re.match(r'(\d+(?:\.\d+)?)°\s*(\d+(?:\.\d+)?)\'\s*(\d+(?:\.\d+)?)"?\s*([NSEW])?', tok, re.IGNORECASE)
+    if m:
+        d = float(m.group(1)); mnt = float(m.group(2)); sec = float(m.group(3))
+        ref = (m.group(4) or '').upper()
+        return d, mnt, sec, ref
+    return None
+
+def _dms_to_decimal(d, m, s, ref):
+    val = d + m/60 + s/3600
+    if ref in ('S','W'):
+        val = -val
+    return val
+
+def _parse_dms(text: str):
+    # Formato típico: 50°49'44.9"N 4°22'13.9"E
+    parts = re.split(r'\s*[;,]\s*|\s{2,}', text.strip())
+    candidates = [p for p in parts if _dms_token(p)]
+    if len(candidates) >= 2:
+        lat_d, lat_m, lat_s, lat_ref = _dms_token(candidates[0])
+        lon_d, lon_m, lon_s, lon_ref = _dms_token(candidates[1])
+        if not lat_ref and lon_ref:
+            lat_ref = 'N'
+        if not lon_ref and lat_ref:
+            lon_ref = 'E'
+        lat = _dms_to_decimal(lat_d, lat_m, lat_s, lat_ref or 'N')
+        lon = _dms_to_decimal(lon_d, lon_m, lon_s, lon_ref or 'E')
+        return lat, lon
+    return None
+
+def smart_parse_coords(text: str):
+    if not text or not text.strip():
+        raise ValueError("Cadena vacía.")
+    # 1) URL de Google Maps
+    p = _parse_google_maps_url(text)
+    if p: return p
+    # 2) Par decimal
+    p = _parse_decimal_pair(text)
+    if p: return p
+    # 3) DMS
+    p = _parse_dms(text)
+    if p: return p
+    raise ValueError("No se pudieron extraer coordenadas. Pega 'lat, lon', DMS o URL de Google Maps.")
+
+# ---------------- EXIF helpers ----------------
 def deg_to_dms_rational(deg: float):
     d = int(abs(deg))
     m_float = (abs(deg) - d) * 60
@@ -69,22 +134,16 @@ def parse_gps(exif_dict: Dict[str, Any]) -> Dict[str, Any]:
         date = date.decode(errors="ignore")
     return {"lat": lat, "lon": lon, "alt": alt, "date": date, "time": time}
 
-# --- Inserción EXIF robusta (modo archivo -> evita el error de 3er argumento) ---
+# Inserción EXIF robusta (archivo→archivo) para evitar errores de 'insert'
 def write_exif_to_image_bytes(img: Image.Image, exif_dict: Dict[str, Any]) -> bytes:
     exif_bytes = piexif.dump(exif_dict)
-
-    # Siempre exportamos primero a JPEG temporal
     with tempfile.TemporaryDirectory() as td:
         in_path = os.path.join(td, "in.jpg")
         out_path = os.path.join(td, "out.jpg")
-
-        # Guardar imagen a JPEG (sin EXIF) en disco
+        # Exportar a JPEG (si viene WebP, se convierte)
         img.save(in_path, format="JPEG", quality=95)
-
-        # Insertar EXIF usando la versión de 3 argumentos (archivo→archivo)
+        # Insertar EXIF usando 3 argumentos (archivo->archivo)
         piexif.insert(exif_bytes, in_path, out_path)
-
-        # Leer resultado a bytes y devolver
         with open(out_path, "rb") as f:
             return f.read()
 
@@ -93,46 +152,67 @@ def process_file(uploaded_file, lat: float, lon: float, alt: Optional[float], wh
     raw_bytes = uploaded_file.read()
     img = Image.open(io.BytesIO(raw_bytes))
 
-    # EXIF antes (si existía)
+    # EXIF antes
     exif_before = load_exif_from_bytes(raw_bytes)
     before = parse_gps(exif_before)
 
-    # Construir EXIF nuevo
+    # Construir EXIF GPS
     exif_dict = exif_before if exif_before else {"0th":{}, "Exif":{}, "GPS":{}, "1st":{}}
     exif_dict["GPS"] = build_gps_ifd(lat, lon, alt, when)
 
-    # Escribir EXIF de forma robusta
+    # Escribir EXIF y recoger bytes resultantes
     out_bytes = write_exif_to_image_bytes(img, exif_dict)
 
-    # Validar EXIF después
+    # EXIF después
     exif_after = load_exif_from_bytes(out_bytes)
     after = parse_gps(exif_after)
 
     out_name = name.rsplit(".",1)[0] + "_geo.jpg"
     return out_name, before, after, out_bytes
 
-# --- UI Streamlit ---
+# ---------------- UI Streamlit ----------------
 st.set_page_config(page_title="Geoetiquetador EXIF", page_icon="📍", layout="centered")
 st.title("📍 Geoetiquetador de Imágenes (EXIF)")
 st.caption("JPEG/TIFF directo. WEBP se convierte a JPEG con EXIF embebido.")
 
 with st.expander("⚙️ Parámetros", expanded=True):
+    st.write("Pega coordenadas o una URL de Google Maps y pulsa **Parse** para fijarlas.")
+
+    # Estado inicial
+    if "lat" not in st.session_state: st.session_state.lat = 50.8291246
+    if "lon" not in st.session_state: st.session_state.lon = 4.3705335
+
+    paste = st.text_input("Coordenadas/URL (ej: '50.8291246, 4.3705335' o un enlace de Google Maps)", value="")
+
+    cparse1, cparse2, _ = st.columns([1,1,2])
+    with cparse1:
+        if st.button("Parse"):
+            try:
+                lat_p, lon_p = smart_parse_coords(paste)
+                if not (-90 <= lat_p <= 90 and -180 <= lon_p <= 180):
+                    raise ValueError("Fuera de rango: lat∈[-90,90], lon∈[-180,180].")
+                st.session_state.lat = round(lat_p, 7)
+                st.session_state.lon = round(lon_p, 7)
+                st.success(f"OK: lat={st.session_state.lat}, lon={st.session_state.lon}")
+            except Exception as e:
+                st.error(f"No válido: {e}")
+    with cparse2:
+        lock = st.checkbox("Bloquear coordenadas", value=True, help="Evita cambios accidentales.")
+
     col1, col2 = st.columns(2)
     with col1:
-        lat = st.number_input("Latitud (grados decimales)", value=50.8291246, step=0.0000001, format="%.7f")
+        lat = st.number_input("Latitud (grados decimales)", value=float(st.session_state.lat), step=0.0000001, format="%.7f", disabled=lock)
         alt = st.number_input("Altitud (m, opcional)", value=0.0, step=0.1)
         use_alt = st.checkbox("Escribir altitud", value=False)
     with col2:
-        lon = st.number_input("Longitud (grados decimales)", value=4.3705335, step=0.0000001, format="%.7f")
+        lon = st.number_input("Longitud (grados decimales)", value=float(st.session_state.lon), step=0.0000001, format="%.7f", disabled=lock)
         use_date = st.checkbox("Escribir fecha/hora GPS (UTC)", value=False)
         if use_date:
             fecha = st.date_input("Fecha", value=datetime.now().date())
             hora = st.time_input("Hora", value=datetime.now().time())
-            # Combinar fecha y hora en un datetime
             dt = datetime.combine(fecha, hora)
         else:
-                dt = None
-
+            dt = None
 
 files = st.file_uploader(
     "Sube imágenes (.jpg, .jpeg, .tif, .tiff, .webp)",
@@ -176,6 +256,7 @@ if files and st.button("Geoetiquetar"):
 
 st.markdown("""---
 **Notas:**
-- Escribe EXIF GPS en JPEG/TIFF. Si subes WEBP, se convierte a JPEG con EXIF.
-- La fecha/hora se guarda en UTC si la marcas.
+- Escribe EXIF GPS en JPEG/TIFF. Si subes WEBP, se convierte a **JPEG** con EXIF.
+- La fecha/hora se guarda en UTC si la activas.
+- El parser acepta: `lat, lon` en decimales, DMS (`50°49'44.9"N 4°22'13.9"E`) o URL de Google Maps.
 """)
